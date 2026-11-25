@@ -54,7 +54,7 @@ class ResultsCanvas(MplCanvas):
         finally:
             self._seep_drawing = False
 
-    def _draw(self, draw_fn, dxf=True):
+    def _draw(self, draw_fn, *args, **kwargs):
         if self._seep_drawing:
             original_draw = draw_fn
 
@@ -70,7 +70,7 @@ class ResultsCanvas(MplCanvas):
                 button.setVisible(self._seep_drawing)
             if not self._seep_drawing:
                 self._result_tools[0].setChecked(False)
-        super()._draw(draw_fn, dxf)
+        super()._draw(draw_fn, *args, **kwargs)
 
     @staticmethod
     def _draw_label(ax, x, y, text):
