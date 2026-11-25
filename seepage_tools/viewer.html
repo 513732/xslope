@@ -1,0 +1,267 @@
+<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>XSLOPE · Seepage results</title>
+<style>
+*{box-sizing:border-box}body{margin:0;background:#f4f6f5;color:#172f38;font:15px/1.45 system-ui, sans-serif}main{max-width:1360px;margin:auto;padding:22px}h1{font-size:24px;margin:0}h2{font-size:19px;margin:0}.sub,small{color:#4d656b}.panel{background:white;border:1px solid #cbd8d7;border-radius:7px;margin:13px 0;padding:15px}button,select,input{font:inherit;color:inherit}button,select{background:white;border:1px solid #a7babb;border-radius:4px;padding:5px 9px}button{cursor:pointer}button:hover{background:#eef5f5}button:focus-visible,select:focus-visible{outline:2px solid #00756e}.row{display:flex;flex-wrap:wrap;align-items:center;gap:8px}.grow{flex:1}.plot{width:100%;height:325px;display:block;touch-action:none}.chart{height:255px}.info{font-variant-numeric:tabular-nums}#metrics{display:flex;gap:24px;flex-wrap:wrap;margin:8px 0}.stat b{display:block;font-size:18px}.stat small{font-size:12px}summary{cursor:pointer}.key{display:inline-block;margin-right:15px}.sw{width:17px;height:3px;vertical-align:middle;display:inline-block;margin-right:5px}button:disabled{opacity:.5}#status{min-height:22px}.read{min-height:23px}#chartNote{margin:5px 0}.range{width:min(40vw,350px)}
+.patch{display:inline-block;width:14px;height:12px;border:1px solid #748084;margin-right:5px;vertical-align:middle}#geoRead,#geoLegend{min-height:22px}#geoControls{margin-top:10px}</style><main><h1>Seepage results</h1><div class="sub" id="model"></div><section class="panel"><div class="row"><label>Pick <select id="mode"><option>Rectangle</option><option>Node</option><option>Mesh edge</option></select></label><label>Action <select id="action"><option>Add</option><option>Remove</option><option>Replace</option></select></label><select id="feature" aria-label="Model boundary"></select><button id="apply">Apply boundary</button><button id="all">All nodes</button><button id="clear">Clear</button><span class="grow"></span><button id="fit">Fit section</button></div>
+<div class="row" id="geoControls"><label>Section shading <select id="layer"><option value="material">Material name</option><option value="k1">Hydraulic conductivity K₁</option><option value="k2">Hydraulic conductivity K₂</option><option value="angle">K₁ orientation</option><option value="ss">Specific storage</option><option value="sy">Specific yield</option><option value="none">None</option></select></label><label><input type="checkbox" id="wire" checked> Mesh lines</label><small id="scaleNote"></small></div><div id="geoLegend"></div>
+<canvas class="plot" id="map" aria-label="Selectable finite element mesh"></canvas>
+<div class="sub" id="geoRead">Move over the section to inspect a material.</div><div class="row"><strong id="status">Reading budget data…</strong><span class="grow"></span><small>Drag to select · Wheel to zoom · Shift-drag to pan</small></div></section>
+<section class="panel"><div class="row"><h2>Selection results</h2><select id="quantity"><option>Flow rate</option><option>Cumulative volume</option><option>Hydraulic head</option><option>Pore pressure</option></select><select id="lines" aria-label="History display"><option>Individual nodes</option><option>Group mean and range</option></select><select id="profileAxis" aria-label="Spatial axis"><option>By section distance</option><option>By elevation</option></select><span class="grow"></span><button id="csv">Export results CSV</button><button id="ids">Export selected nodes</button></div>
+<div id="chartNote" class="sub"></div><canvas class="plot chart" id="chart" aria-label="History of selected nodes"></canvas><div id="legend"></div>
+<div class="row"><label id="timeControls">Inspect time <input class="range" id="time" type="range" min="0" value="0" step="1"></label><b id="timeLabel"></b></div><div id="metrics"></div><details id="valuesPanel"><summary>Selected node values</summary><table style="border-spacing:14px 3px;text-align:right"><thead><tr id="valueHeader"></tr></thead><tbody id="valueRows"></tbody></table><button id="previous">Previous</button> <span id="pageLabel"></span> <button id="next">Next</button></details></section>
+<details class="panel"><summary>How to interpret this budget</summary><p>Boundary inflow and outflow are positive magnitudes at selected external boundary nodes. For a pumped pit, read boundary outflow. Internal exchange is signed positive into the selected nodal set. Storage gain is positive. The residual equals boundary inflow − boundary outflow + internal exchange − storage gain. An interior set can exchange water and change storage even when external flows are zero.</p><p>Selection is a union of node IDs. Selecting an edge includes its end nodes and any midside node. The budget includes each selected node’s complete assembled reaction. At a shared corner, an isolated edge therefore has no unique edge-specific share. Internal exchange is the net conductive contribution to those finite-element rows, not a reconstructed normal flux across a user-drawn line.</p><p>Flow rates are step averages assigned to the end of each accepted interval. Volumes integrate every accepted step. Head and pressure are sampled at saved frames; choose individual node histories or their unweighted mean and range. Steady head and pressure plots show node values against distance or elevation. A steady solution has no cumulative volume. All flows and volumes refer to one unit of out-of-plane width.</p><small id="hash"></small></details></main>
+<script id="dataset" type="application/json">/*MODEL_DATA*/</script><script>
+'use strict';
+const el=id=>document.getElementById(id), D=JSON.parse(el('dataset').textContent);
+const fields=['external','storage','transfer','head'],N=D.nodes.length;
+const map=el('map'), chart=el('chart'),selected=new Set(), fmt=n=>Number.isFinite(n)?Number(n.toPrecision(5)).toString():'—';
+const lengthUnit=/imperial/i.test(D.system)?'ft':/si|metric/i.test(D.system)?'m':'length unit',day=D.timeUnit;
+const rateUnit=lengthUnit+'³/'+day+' per '+lengthUnit, volumeUnit=lengthUnit+'³ per '+lengthUnit;
+let box,drag=null,chartData=[],series=[],tx,stats,stepTotals,ready=false;
+const colors=['#067969','#be552b','#386bb1','#7c4c85','#4b555a'];
+const labs=['Boundary inflow','Boundary outflow','Internal exchange','Storage gain','Residual'];
+const foot=['Step-average rates','Volumes since time zero','Nodal head','Nodal pore pressure'];
+const hid=()=>el('quantity').selectedIndex>=2;
+function fit(){const x=D.nodes.map(p=>p[0]),y=D.nodes.map(p=>p[1]);const span=a=>a.reduce((s,v)=>[Math.min(s[0],v),Math.max(s[1],v)],[Infinity,-Infinity]);const [a,b]=span(x),[c,d]=span(y);box=[a-.025*(b-a),b+.025*(b-a),c-.075*(d-c),d+.075*(d-c)];}
+function surface(c){let w=c.clientWidth,h=c.clientHeight,scale=window.devicePixelRatio||1;if(c.width!==Math.round(w*scale)||c.height!==Math.round(h*scale)){c.width=Math.round(w*scale);c.height=Math.round(h*scale)}let g=c.getContext('2d');g.setTransform(scale,0,0,scale,0,0);g.clearRect(0,0,w,h);g.font='12px system-ui';return [g,w,h]}
+function proj(p){return [52+(p[0]-box[0])/(box[1]-box[0])*(map.clientWidth-68),map.clientHeight-32-(p[1]-box[2])/(box[3]-box[2])*(map.clientHeight-48)]}
+function world(p){return [box[0]+(p[0]-52)/(map.clientWidth-68)*(box[1]-box[0]),box[2]+(map.clientHeight-32-p[1])/(map.clientHeight-48)*(box[3]-box[2])]}
+function line(g,a,b){g.moveTo(...a);g.lineTo(...b)}
+function axes(g,w,h,x0,x1,y0,y1){g.strokeStyle='#d2dddc';g.fillStyle='#50696d';g.beginPath();for(let i=0;i<=5;i++){let f=i/5,x=52+f*(w-68),y=h-32-f*(h-48);line(g,[x,16],[x,h-32]);line(g,[52,y],[w-16,y]);g.fillText(fmt(x0+f*(x1-x0)),Math.min(x-9,w-42),h-10);g.textAlign='right';g.fillText(fmt(y0+f*(y1-y0)),48,y+3);g.textAlign='left'}g.stroke()}
+const geo = D.geology;
+const properties = {
+  k1:['K₁',lengthUnit+'/'+day], k2:['K₂',lengthUnit+'/'+day],
+  angle:['K₁ angle from section x','°'], ss:['Specific storage','1/'+lengthUnit],
+  sy:['Specific yield','–']
+};
+const palette=['#dcc6a0','#92c7cb','#a79ab9','#b8c991','#daa6a4','#9eafd3'];
+const materialIds=Object.keys(geo.materials).map(Number);
+const paths=new Map(), contacts=new Path2D(), outlines=new Map();
+const bounds=geo.cells.map(([id,ring])=>{
+  if(!paths.has(id))paths.set(id,new Path2D());
+  const path=paths.get(id),points=ring.map(n=>D.nodes[n]);
+  points.forEach(([x,y],i)=>i?path.lineTo(x,y):path.moveTo(x,y));path.closePath();
+  ring.forEach((a,i)=>{
+    const b=ring[(i+1)%ring.length],key=Math.min(a,b)+','+Math.max(a,b);
+    if(outlines.has(key)&&outlines.get(key)!==id){
+      contacts.moveTo(...D.nodes[a]);contacts.lineTo(...D.nodes[b]);
+    }
+    outlines.set(key,id);
+  });
+  const xs=points.map(p=>p[0]),ys=points.map(p=>p[1]);
+  return [Math.min(...xs),Math.max(...xs),Math.min(...ys),Math.max(...ys)];
+});
+outlines.clear();
+let swatches=new Map();
+function propText(row,key){
+  const [label,unit]=properties[key];
+  return label+' '+(row[key]==null?'unspecified':fmt(row[key])+(unit==='–'?'':' '+unit));
+}
+function materialLegend(){
+  const key=el('layer').value, numeric=Object.hasOwn(properties,key);
+  const values=numeric?materialIds.map(i=>geo.materials[i][key]).filter(Number.isFinite):[];
+  const log=['k1','k2'].includes(key)&&values.length>0&&Math.min(...values)>0;
+  const scale=v=>log?Math.log10(v):v;
+  const lo=scale(Math.min(...values)),hi=scale(Math.max(...values));
+  const chips=[];
+  materialIds.forEach((id,i)=>{
+    const row=geo.materials[id],v=row[key];
+    let color=palette[i]||('hsl('+((i*137.5)%360)+' 35% 73%)');
+    if(numeric){
+      const fraction=hi===lo?.5:(scale(v)-lo)/(hi-lo);
+      color=v==null?'#dedede':'hsl(205 48% '+(92-50*fraction)+'%)';
+    }
+    swatches.set(id,color);
+    const label=document.createElement('span'),chip=document.createElement('i');
+    label.className='key';chip.className='patch';chip.style.background=color;
+    label.append(chip,row.name+(numeric?' · '+propText(row,key):''));chips.push(label);
+  });
+  el('geoLegend').replaceChildren(...(key==='none'?[]:chips));
+  el('scaleNote').textContent=numeric&&hi>lo?(log?'Logarithmic scale':'Linear scale')+' · darker = higher':'';
+}
+function paintMaterials(g,w,h){
+  if(el('layer').value==='none')return;
+  const transform=new DOMMatrix([(w-68)/(box[1]-box[0]),0,0,-(h-48)/(box[3]-box[2]),...proj([0,0])]);
+  for(const [id,path] of paths){
+    const screen=new Path2D();screen.addPath(path,transform);g.fillStyle=swatches.get(id);g.fill(screen);
+  }
+  const screen=new Path2D();screen.addPath(contacts,transform);g.strokeStyle='#434b50';g.lineWidth=1.4;g.stroke(screen);
+}
+function identifyMaterial(p){
+  const [x,y]=world(p),label=el('geoRead');
+  label.textContent='x '+fmt(x)+' · elevation '+fmt(y)+' '+lengthUnit;
+  if(p[0]<52||p[0]>map.clientWidth-16||p[1]<16||p[1]>map.clientHeight-32)return;
+  for(let i=0;i<bounds.length;i++){
+    const [l,r,b,t]=bounds[i];if(x<l||x>r||y<b||y>t)continue;
+    const [id,ring]=geo.cells[i];let inside=false;
+    for(let j=0,k=ring.length-1;j<ring.length;k=j++){
+      const [ax,ay]=D.nodes[ring[j]],[bx,by]=D.nodes[ring[k]];
+      if((ay>y)!==(by>y)&&x<(bx-ax)*(y-ay)/(by-ay)+ax)inside=!inside;
+    }
+    if(inside){
+      const row=geo.materials[id];
+      label.textContent+=' · '+row.name+' · '+Object.keys(properties).map(key=>propText(row,key)).join(' · ');
+      return;
+    }
+  }
+  label.textContent+=' · outside mesh';
+}
+el('layer').onchange=()=>{materialLegend();if(ready)drawMap()};
+el('wire').onchange=()=>{if(ready)drawMap()};
+map.onpointerleave=()=>{el('geoRead').textContent='Move over the section to inspect a material.'};
+
+function drawMap(){const [g,w,h]=surface(map);axes(g,w,h,...box);const xy=D.nodes.map(proj);g.save();g.beginPath();g.rect(52,16,w-68,h-48);g.clip();paintMaterials(g,w,h);for(const outside of [false,true]){if(!outside&&!el('wire').checked)continue;g.strokeStyle=outside?'#394f54':'#b7c9c9';g.lineWidth=outside?1.4:.55;g.beginPath();for(const [a,b,m,k] of D.edges){if((k===1)!==outside)continue;if(m>=0){line(g,xy[a],xy[m]);line(g,xy[m],xy[b])}else line(g,xy[a],xy[b])}g.stroke()}
+ g.fillStyle='#c34716';for(const n of selected){let [x,y]=xy[n];g.fillRect(x-1.9,y-1.9,3.8,3.8)}g.restore();if(drag&&!drag.pan&&el('mode').value==='Rectangle'){g.strokeStyle='#c34716';g.strokeRect(drag.a[0],drag.a[1],drag.b[0]-drag.a[0],drag.b[1]-drag.a[1])}g.fillStyle='#40575b';g.fillText('Section x / elevation ('+lengthUnit+')',55,12)}
+function update(nodes,action=el('action').value){if(action==='Replace')selected.clear();for(const n of nodes){if(action==='Remove')selected.delete(n);else selected.add(n)}refresh()}
+function refresh(){if(!ready)return;el('status').textContent=selected.size.toLocaleString()+' of '+N.toLocaleString()+' nodes selected';drawMap();compute();configureChart()}
+function compute(){let ids=[...selected],vol=[0,0,0,0,0];stepTotals=D.times.map((t,i)=>{let q=[0,0,0,0,0],off=i*N;for(const n of ids){let j=off+n,v=D.external[j];q[0]+=Math.max(v,0);q[1]+=Math.max(-v,0);q[2]+=D.transfer[j];q[3]+=D.storage[j]}q[4]=q[0]-q[1]+q[2]-q[3];vol=vol.map((x,k)=>x+q[k]*D.dt[i]);return {q,v:vol}})}
+function configureChart(){
+ el('valuesPanel').hidden=!hid();el('lines').hidden=steady||!hid();el('profileAxis').hidden=!steady||!hid();el('timeControls').hidden=steady;
+ if(hid()){
+  tx=D.frames;el('time').max=tx.length-1;el('time').value=Math.min(Number(el('time').value),tx.length-1);
+  fieldDraw();return;
+ }
+ if(steady){tx=[0];el('legend').replaceChildren();steadyBudget();return}
+const k=el('quantity').selectedIndex;tx=hid()?D.frames:D.times;const ids=[...selected];series=hid()?['Mean','Minimum','Maximum']:labs;
+chartData=hid()?D.frames.map((_,i)=>{let sum=0,lo=Infinity,hi=-Infinity;for(const n of ids){let h=D.head[i*N+n],v=k===2?h:(h-D.nodes[n][1])*D.gamma;sum+=v;lo=Math.min(lo,v);hi=Math.max(hi,v)}return ids.length?[sum/ids.length,lo,hi]:[0,0,0]}):stepTotals.map(s=>k?s.v:s.q);
+el('time').max=tx.length-1;el('time').value=Math.min(Number(el('time').value),tx.length-1);
+el('legend').replaceChildren(...series.map((s,i)=>{let node=document.createElement('span');node.className='key';let chip=document.createElement('span');chip.className='sw';chip.style.background=colors[i];node.append(chip,s);return node}));el('chartNote').textContent=foot[k]+' · '+units()+' · time in '+day;drawChart()}
+function units(){return [rateUnit,volumeUnit,lengthUnit,lengthUnit==='m'?'kPa':lengthUnit==='ft'?'psf':'stress units'][el('quantity').selectedIndex]}
+function drawChart(){if(hid()){fieldDraw();return}if(steady){steadyBudget();return}const [g,w,h]=surface(chart);const n=Number(el('time').value),end=tx.at(-1);let lo=Infinity,hi=-Infinity;for(const row of chartData)for(const v of row){lo=Math.min(lo,v);hi=Math.max(hi,v)}if(!hid()){lo=Math.min(0,lo);hi=Math.max(0,hi)}if(hi-lo<1e-13){hi+=.5;lo-=.5}let span=hi-lo;lo-=span*.04;hi+=span*.04;
+ const x=t=>52+t/end*(w-68),y=v=>h-32-(v-lo)/(hi-lo)*(h-48);axes(g,w,h,0,end,lo,hi);if(selected.size){series.forEach((_,k)=>{g.beginPath();g.strokeStyle=colors[k];g.lineWidth=1.7;if(el('quantity').selectedIndex===1)g.moveTo(x(0),y(0));chartData.forEach((r,i)=>{if(!i&&el('quantity').selectedIndex===0)g.moveTo(x(0),y(r[k]));if(i&&el('quantity').selectedIndex===0)g.lineTo(x(tx[i-1]),y(r[k]));g.lineTo(x(tx[i]),y(r[k]))});g.stroke()});g.strokeStyle='#23373d';g.setLineDash([3,3]);g.beginPath();line(g,[x(tx[n]),16],[x(tx[n]),h-32]);g.stroke();g.setLineDash([])}
+ el('timeLabel').textContent=fmt(tx[n])+' '+day;el('metrics').replaceChildren(...series.map((s,i)=>{let a=document.createElement('div');a.className='stat';let b=document.createElement('b'),c=document.createElement('small');b.textContent=selected.size?fmt(chartData[n][i]):'—';c.textContent=s;a.append(b,c);return a}))}
+function pos(e){const r=map.getBoundingClientRect();return [e.clientX-r.left,e.clientY-r.top]}
+map.onpointerdown=e=>{if(!ready||e.button!==0)return;let a=pos(e);drag={a,b:a,pan:e.shiftKey,box:box.slice()};map.setPointerCapture(e.pointerId)};
+map.onpointermove=e=>{if(!drag){if(ready)identifyMaterial(pos(e));return}drag.b=pos(e);if(drag.pan){let b=drag.box,dx=(drag.a[0]-drag.b[0])/(map.clientWidth-68)*(b[1]-b[0]),dy=(drag.b[1]-drag.a[1])/(map.clientHeight-48)*(b[3]-b[2]);box=[b[0]+dx,b[1]+dx,b[2]+dy,b[3]+dy]}drawMap()};
+function segDist(p,a,b){let dx=b[0]-a[0],dy=b[1]-a[1],t=Math.max(0,Math.min(1,((p[0]-a[0])*dx+(p[1]-a[1])*dy)/(dx*dx+dy*dy||1)));return Math.hypot(a[0]+t*dx-p[0],a[1]+t*dy-p[1])}
+map.onpointerup=e=>{if(!drag)return;const {a,pan}=drag,b=pos(e);drag=null;if(pan)return;let picked=[],mode=el('mode').value;if(mode==='Rectangle'){let [x,y]=world(a),[u,v]=world(b);D.nodes.forEach(([px,py],i)=>{if(px>=Math.min(x,u)&&px<=Math.max(x,u)&&py>=Math.min(y,v)&&py<=Math.max(y,v))picked.push(i)})}else if(mode==='Mesh edge'){let best=9,xy=D.nodes.map(proj);for(const [i,j,m] of D.edges){const dist=m<0?segDist(b,xy[i],xy[j]):Math.min(segDist(b,xy[i],xy[m]),segDist(b,xy[m],xy[j]));if(dist<best){best=dist;picked=m<0?[i,j]:[i,m,j]}}}else{let best=9;D.nodes.forEach((p,i)=>{const [u,v]=proj(p),dist=Math.hypot(b[0]-u,b[1]-v);if(dist<best){best=dist;picked=[i]}})}update(picked)};
+map.onpointercancel=()=>{drag=null;drawMap()};map.onwheel=e=>{if(!ready)return;e.preventDefault();const a=world(pos(e)),k=Math.exp(Math.sign(e.deltaY)*.18);box=box.map((v,i)=>a[i<2?0:1]+(v-a[i<2?0:1])*k);drawMap()};
+function csv(name,header,rows){let blob=new Blob([[header,...rows].map(r=>r.join(',')).join('\r\n')],{type:'text/csv'});let a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download=name;a.click();setTimeout(()=>URL.revokeObjectURL(a.href),2000)}
+el('csv').onclick=()=>{if(!selected.size)return;let index=el('quantity').selectedIndex;if(hid()){exportFields();return}if(steady){csv('steady_water_budget.csv',labs.map(l=>l+' ('+rateUnit+')'),[stepTotals[0].q]);return}csv('selected_water_budget.csv',['step_end_'+day,'dt_'+day,...labs.map(l=>l+' ('+rateUnit+')'),...labs.map(l=>'cumulative '+l+' ('+volumeUnit+')')],tx.map((t,i)=>[t,D.dt[i],...stepTotals[i].q,...stepTotals[i].v]))};
+el('ids').onclick=()=>csv('selected_nodes.csv',['node_id','x','elevation'],[...selected].sort((a,b)=>a-b).map(i=>[i+1,...D.nodes[i]]));
+el('fit').onclick=()=>{fit();drawMap()};el('clear').onclick=()=>update([],'Replace');el('all').onclick=()=>update(D.nodes.keys(),'Replace');el('apply').onclick=()=>update(D.features[el('feature').selectedIndex][1]);el('quantity').onchange=()=>{if(ready)configureChart()};el('time').oninput=()=>{if(ready)drawChart()};chart.onclick=e=>{if(!ready||steady)return;const p=e.clientX-chart.getBoundingClientRect().left,t=(p-52)/(chart.clientWidth-68)*tx.at(-1);let n=0;for(let i=1;i<tx.length;i++)if(Math.abs(tx[i]-t)<Math.abs(tx[n]-t))n=i;el('time').value=n;drawChart()};
+const steady = D.analysis === 'steady';
+const fieldNames=['Hydraulic head','Pore pressure'];
+function fieldValue(frame,node){
+ const head=D.head[frame*N+node];
+ return el('quantity').selectedIndex===2 ? head : D.gamma*(head-D.nodes[node][1]);
+}
+function colorFor(i){return 'hsl('+((i*137.508+170)%360)+' 62% 37%)'}
+function sortedNodes(){return [...selected].sort((a,b)=>a-b)}
+function summary(values){
+ let sum=0,lo=Infinity,hi=-Infinity;
+ for(const v of values){sum+=v;lo=Math.min(lo,v);hi=Math.max(hi,v)}
+ return values.length?[sum/values.length,lo,hi]:[];
+}
+function metrics(labels,values){
+ el('metrics').replaceChildren(...labels.map((s,i)=>{
+  const a=document.createElement('div'),b=document.createElement('b'),c=document.createElement('small');
+  a.className='stat';b.textContent=fmt(values[i]);c.textContent=s;a.append(b,c);return a;
+ }));
+}
+let tablePage=0;
+function showValues(){
+ const ids=sortedNodes(),frame=steady?0:Number(el('time').value),size=25;
+ tablePage=Math.min(tablePage,Math.max(0,Math.ceil(ids.length/size)-1));
+ const title=['Node','Section x ('+lengthUnit+')','Elevation ('+lengthUnit+')','Head ('+lengthUnit+')','Pore pressure ('+(lengthUnit==='m'?'kPa':lengthUnit==='ft'?'psf':'stress units')+')'];
+ el('valueHeader').replaceChildren(...title.map(v=>{const c=document.createElement('th');c.textContent=v;return c}));
+ el('valueRows').replaceChildren(...ids.slice(tablePage*size,(tablePage+1)*size).map(n=>{
+  const tr=document.createElement('tr'),p=D.nodes[n],h=D.head[frame*N+n];
+  for(const v of [n+1,...p,h,(h-p[1])*D.gamma]){const c=document.createElement('td');c.textContent=fmt(v);tr.append(c)}
+  return tr
+ }));
+ el('previous').disabled=tablePage===0;el('next').disabled=(tablePage+1)*size>=ids.length;
+ el('pageLabel').textContent=ids.length?'Page '+(tablePage+1)+' of '+Math.ceil(ids.length/size):'No nodes';
+}
+el('previous').onclick=()=>{if(tablePage>0)tablePage--;showValues()};el('next').onclick=()=>{tablePage++;showValues()};
+function fieldDraw(){
+ showValues();
+ const [g,w,h]=surface(chart),ids=sortedNodes(),frame=steady?0:Number(el('time').value);
+ const axis=el('profileAxis').selectedIndex,individual=el('lines').selectedIndex===0;
+ const atFrame=ids.map(n=>fieldValue(frame,n));
+ let xvals, curves, xmin,xmax,ymin=Infinity,ymax=-Infinity;
+ const unit=units(),name=fieldNames[el('quantity').selectedIndex-2];
+ if(steady){
+  xvals=ids.map(n=>D.nodes[n][axis]);xmin=Infinity;xmax=-Infinity;
+  for(const x of xvals){xmin=Math.min(xmin,x);xmax=Math.max(xmax,x)}
+  curves=[atFrame];
+ }else{
+  xvals=D.frames;xmin=0;xmax=xvals.at(-1);
+  if(individual)curves=ids.map(n=>D.frames.map((t,i)=>fieldValue(i,n)));
+  else {
+   const agg=D.frames.map((t,i)=>summary(ids.map(n=>fieldValue(i,n))));
+   curves=ids.length?[0,1,2].map(k=>agg.map(r=>r[k])):[];
+  }
+ }
+ for(const row of curves)for(const v of row){ymin=Math.min(ymin,v);ymax=Math.max(ymax,v)}
+ if(!ids.length){el('metrics').replaceChildren();el('legend').textContent='Select one or more nodes.';el('chartNote').textContent='';return}
+ if(xmax===xmin){xmin-=.5;xmax+=.5}
+ let pad=Math.max((ymax-ymin)*.06,Math.abs(ymax)*1e-8,1e-6);ymin-=pad;ymax+=pad;
+ const px=x=>52+(x-xmin)/(xmax-xmin)*(w-68),py=y=>h-32-(y-ymin)/(ymax-ymin)*(h-48);
+ axes(g,w,h,xmin,xmax,ymin,ymax);
+ if(steady){
+  g.fillStyle=colors[0];for(let i=0;i<ids.length;i++){g.beginPath();g.arc(px(xvals[i]),py(atFrame[i]),3,0,Math.PI*2);g.fill()}
+ }else{
+  curves.forEach((vs,i)=>{g.strokeStyle=individual?colorFor(i):colors[i];g.lineWidth=1.4;g.beginPath();
+   vs.forEach((v,j)=>j?g.lineTo(px(xvals[j]),py(v)):g.moveTo(px(xvals[j]),py(v)));g.stroke()});
+  g.strokeStyle='#7a8588';g.beginPath();line(g,[px(xvals[frame]),16],[px(xvals[frame]),h-32]);g.stroke()
+ }
+ el('chartNote').textContent=name+' ('+unit+') · '+(steady?(axis?'Elevation':'Section distance')+' ('+lengthUnit+')':'Time ('+day+')');
+ const labels=steady?[]:individual?ids.map(n=>'Node '+(n+1)):['Mean','Minimum','Maximum'];
+ const legend=el('legend');legend.replaceChildren();
+ if(labels.length<=24)labels.forEach((label,i)=>{const s=document.createElement('span');s.className='key';s.style.color=individual?colorFor(i):colors[i];s.textContent=label;legend.append(s)});
+ else legend.textContent=labels.length+' node traces · export node values for labelled series';
+ if(steady)legend.textContent='Each point represents one selected mesh node.';
+ if(ids.length===1)metrics([name+' ('+unit+')','Node','Section distance ('+lengthUnit+')','Elevation ('+lengthUnit+')'],[atFrame[0],ids[0]+1,...D.nodes[ids[0]]]);
+ else metrics(['Group mean ('+unit+')','Minimum ('+unit+')','Maximum ('+unit+')'],summary(atFrame));
+ el('timeLabel').textContent=steady?'Steady state':fmt(D.frames[frame])+' '+day;
+}
+function steadyBudget(){
+ const [g,w,h]=surface(chart),values=stepTotals[0].q;
+ el('chartNote').textContent='Steady nodal budget · '+rateUnit;
+ const lo=Math.min(0,...values),hi=Math.max(0,...values),span=(hi-lo)||1;
+ const yy=v=>18+(hi+.08*span-v)/(1.16*span)*(h-58);
+ for(let i=0;i<values.length;i++){const x=55+(w-88)*(i+.5)/values.length;
+  g.fillStyle=colors[i];g.fillRect(x-19,Math.min(yy(0),yy(values[i])),38,Math.max(1,Math.abs(yy(values[i])-yy(0))));
+  g.fillStyle='#31454a';g.textAlign='center';g.fillText(labs[i],x,h-12);g.textAlign='left'}
+ metrics(labs,selected.size?values:[]);el('timeLabel').textContent='Steady state';
+}
+function exportFields(){
+ const rows=[],ids=sortedNodes();
+ for(let i=0;i<D.frames.length;i++)for(const n of ids){
+  const h=D.head[i*N+n],p=D.nodes[n],data=[n+1,...p,h,(h-p[1])*D.gamma];rows.push(steady?data:[D.frames[i],...data])
+ }
+ const labels=['node_id','x ('+lengthUnit+')','elevation ('+lengthUnit+')','head ('+lengthUnit+')','pore pressure ('+(lengthUnit==='m'?'kPa':lengthUnit==='ft'?'psf':'stress units')+')'];
+ csv('selected_nodal_fields.csv',steady?labels:['time_'+day,...labels],rows);
+}
+
+el('lines').onchange=el('profileAxis').onchange=()=>{if(ready)configureChart()};
+async function start(){el('quantity').selectedIndex=2;el('quantity').options[1].disabled=steady;el('model').textContent=D.model+' · '+(steady?'Steady state · BC set '+(D.bcSet||1):'Transient seepage');el('hash').textContent='Input workbook SHA-256: '+D.sha256;
+for(const key of fields){const bin=Uint8Array.from(atob(D[key]),c=>c.charCodeAt(0));const stream=new Blob([bin]).stream().pipeThrough(new DecompressionStream('gzip'));D[key]=new Float64Array(await new Response(stream).arrayBuffer())}
+D.features.forEach(([label])=>el('feature').add(new Option(label)));el('apply').disabled=!D.features.length;
+const first=D.features.findIndex(([s])=>s.includes('Launch'));if(first>=0)el('feature').selectedIndex=first;
+materialLegend();fit();ready=true;update(D.features[el('feature').selectedIndex]?.[1]||[],'Replace');new ResizeObserver(()=>{drawMap();drawChart()}).observe(map)}
+if(D.climate){
+ const c=D.climate,box=document.createElement('section');box.className='panel';
+ const title=document.createElement('h2');title.textContent='Pumping demand';
+ const caption=document.createElement('p');caption.textContent=c.name+(c.steady?' · steady groundwater rate applied throughout the climate window':' · daily volumes from accepted solver steps');
+ const pick=document.createElement('select');pick.setAttribute('aria-label','Select pit');
+ c.pits.forEach((p,i)=>pick.add(new Option(p.name,i)));
+ const canvas=document.createElement('canvas');canvas.className='plot chart';
+ const note=document.createElement('p');note.textContent='Groundwater (teal) · Direct rainfall (blue) · Combined (orange). Daily mean m³/day.';
+ box.append(title,caption,pick,canvas,note);document.querySelector('main').append(box);
+ function plot(){
+   const [g,w,h]=surface(canvas),p=c.pits[pick.selectedIndex];if(!p)return;
+   const upper=p.total.reduce((a,v)=>Math.max(a,v),1),n=p.total.length;
+   axes(g,w,h,1,Math.max(2,n),0,upper);
+   for(const [key,color] of [['groundwater','#067969'],['rain','#386bb1'],['total','#be552b']]){
+     g.beginPath();g.strokeStyle=color;g.lineWidth=1.8;
+     p[key].forEach((v,i)=>{const x=52+i/Math.max(1,n-1)*(w-68),y=h-32-v/upper*(h-48);if(i)g.lineTo(x,y);else g.moveTo(x,y);if(n===1){g.fillStyle=color;g.fillRect(x-2,y-2,4,4)}});g.stroke();
+   }
+   g.fillStyle='#40575b';g.fillText('Daily mean m³/day · construction day ending',55,12);
+ }
+ pick.onchange=plot;new ResizeObserver(plot).observe(canvas);
+}
+
+start().catch(e=>el('status').textContent='Could not read budget data: '+e.message);
+</script></html>
