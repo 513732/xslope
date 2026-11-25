@@ -2,14 +2,15 @@
 import json
 import sys
 from pathlib import Path
-from PySide6.QtCore import QProcess,QProcessEnvironment,QUrl
-from PySide6.QtGui import QDesktopServices
+from PySide6.QtCore import QProcess,QProcessEnvironment,Signal
 from PySide6.QtWidgets import (QDialog,QFileDialog,QHBoxLayout,QLabel,QLineEdit,
                                QMessageBox,QPlainTextEdit,QPushButton,QVBoxLayout)
 from climate_run import template
 
 
 class ClimateDialog(QDialog):
+    results_ready = Signal(str)
+
     def __init__(self,parent):
         super().__init__(parent);self.setWindowTitle('UKCP18 surface water balance');self.resize(850,720)
         layout=QVBoxLayout(self);bar=QHBoxLayout();layout.addLayout(bar)
@@ -49,6 +50,7 @@ class ClimateDialog(QDialog):
         if not self.save():return
         data=json.loads(self.edit.toPlainText())
         env=QProcessEnvironment.systemEnvironment()
+        env.insert('PYTHONUTF8','1')
         if self.key.text():env.insert('UKCP_API_KEY',self.key.text())
         if not (data.get('paired_csv') or data.get('rain_folder') or env.value('UKCP_API_KEY')):
             QMessageBox.warning(self,'Climate inputs','Enter the UKCP key or select local climate inputs in the project.');return
@@ -64,7 +66,9 @@ class ClimateDialog(QDialog):
         self.output();self.go.setEnabled(True)
         if code:QMessageBox.warning(self,'Climate run',self.tail[-800:]);return
         p=Path(self.tail.strip().splitlines()[-1])
-        if p.is_file():QDesktopServices.openUrl(QUrl.fromLocalFile(str(p)))
+        if p.is_file():
+            self.results_ready.emit(str(p.resolve()))
+            self.accept()
 
     def reject(self):
         if self.process.state()!=QProcess.NotRunning:

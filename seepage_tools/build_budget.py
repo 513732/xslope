@@ -52,6 +52,19 @@ def mesh_edges(elements, types):
     return list(edges.values())
 
 
+def section_triangles(elements, types):
+    """Subdivide supported elements for nodal contour interpolation."""
+    patterns = {
+        3: [(0, 1, 2)],
+        6: [(0, 3, 5), (3, 1, 4), (5, 4, 2), (3, 4, 5)],
+        4: [(0, 1, 2), (0, 2, 3)],
+        8: [(0, 4, 7), (1, 5, 4), (2, 6, 5), (3, 7, 6), (4, 5, 6), (4, 6, 7)],
+        9: [(a, b, 8) for a, b in zip((0,4,1,5,2,6,3,7), (4,1,5,2,6,3,7,0))],
+    }
+    return [[int(row[i]) for i in tri] for row, kind in zip(elements, types, strict=True)
+            for tri in patterns[int(kind)]]
+
+
 def material_map(sd, model):
     """Match each element perimeter with its one-based solver material ID."""
     cells = []
@@ -75,6 +88,16 @@ def material_map(sd, model):
             row[key] = value if np.isfinite(value) and not missing else None
         materials[mid] = row
     return {"cells": cells, "materials": materials}
+
+
+def frame_velocities(seep_data, frames, unconfined):
+    """Use the same velocity recovery as Studio's saved transient frames."""
+    elements, element_types, k1, k2, angle, kr0, h0, vg_a, vg_n, vg_l, model = seep._elem_props(seep_data)
+    options = {"element_types": element_types}
+    if unconfined:
+        options.update(kr0=kr0, h0=h0, vg_a=vg_a, vg_n=vg_n, vg_l=vg_l, model=model)
+    return [seep.compute_velocity(seep_data["nodes"], elements, frame["head"], k1, k2, angle, **options)
+            for frame in frames]
 
 
 def build(path, output, mode="auto", bc_set=1, climate=None):
@@ -146,10 +169,13 @@ def build(path, output, mode="auto", bc_set=1, climate=None):
         times, dt = [0.0], [0.0]
         external, transfer, storage = [ext], [-q], [np.zeros_like(q)]
         result = {"times": [0.0], "frames": [{"head": steady["head"]}]}
+    velocities = (frame_velocities(sd, result["frames"], result["unconfined"])
+                  if transient else [steady["velocity"]])
     data = dict(geology=material_map(sd, model), model=path.stem, analysis="transient" if transient else "steady", bcSet=bc_set, nodes=nodes.tolist(), edges=mesh_edges(mesh['elements'],mesh['element_types']),
+                triangles=section_triangles(mesh['elements'], mesh['element_types']),
                 features=features, times=times,dt=dt, frames=result['times'],
                 external=encode(external), transfer=encode(transfer), storage=encode(storage),
-                head=encode([f['head'] for f in result['frames']]), gamma=sd['unit_weight'],
+                head=encode([f['head'] for f in result['frames']]), velocity=encode(velocities), gamma=sd['unit_weight'],
                 timeUnit=sd.get('time_unit') or 'time unit',system=sd.get('unit_system') or '',
                 sha256=hashlib.sha256(path.read_bytes()).hexdigest())
     if climate is not None:
